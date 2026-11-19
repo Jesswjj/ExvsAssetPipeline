@@ -1119,6 +1119,58 @@ def generate_gauges(workspace: Path, game_dir: Path, out_images: Path) -> Dict[s
     return {"gauges_webp": cnt}
 
 
+def generate_stamps(game_dir: Path, out_images: Path) -> Dict[str, int]:
+    """
+    Parses 0xED5C1B36.fhm2d (Master Communication Stamp Table: 430 valid stamps in IB)
+    and extracts the native RGBA8 600x160 stamp textures (`46XTun_l_XXXX`, col 0xC5A29798)
+    directly to `images/stamps/{id}.webp` (plus transparent `0.webp`).
+    """
+    stamp_db = game_dir / "0xED5C1B36.fhm2d"
+    if not stamp_db.exists():
+        return {"stamps_webp": 0}
+
+    stamps_dir = out_images / "stamps"
+    stamps_dir.mkdir(parents=True, exist_ok=True)
+    save_webp(Image.new("RGBA", (600, 160), (0, 0, 0, 0)), stamps_dir / "0.webp")
+
+    blocks = list(iter_fhm2d_deflate_blocks(stamp_db.read_bytes()))
+    blob = blocks[1][3]
+    num_rows, num_cols, row_stride = struct.unpack_from("<III", blob, 0x10)
+    col_hashes = list(struct.unpack_from(f"<{num_cols}I", blob, 0x20))
+    desc_off = 0x20 + num_cols * 4
+    col_descs = [struct.unpack_from("<QI", blob, desc_off + c * 12) for c in range(num_cols)]
+    rows_data_off = (num_cols + 2) * 16 + 4 * num_rows
+
+    cnt = 0
+    for r in range(num_rows):
+        rbase = rows_data_off + r * row_stride
+        row_dict = {
+            col_hash: struct.unpack_from("<I", blob, rbase + col_off)[0]
+            for (col_off, _), col_hash in zip(col_descs, col_hashes)
+        }
+        st_id = row_dict.get(0x1111D441, 0)
+        pkg_hash = row_dict.get(0xC5A29798, 0)
+        if st_id <= 0 or pkg_hash == 0:
+            continue
+        fhm = game_dir / f"0x{pkg_hash:08X}.fhm2d"
+        if not fhm.exists() or fhm.stat().st_size <= 64:
+            continue
+        blks = list(iter_fhm2d_deflate_blocks(fhm.read_bytes()))
+        pay = b"".join(b for _, _, _, b in blks[1:])
+        if len(pay) < 0xB0:
+            continue
+        ft_off = len(pay) - 0xB0
+        w = int.from_bytes(pay[ft_off + 0x84 : ft_off + 0x88], "little")
+        h = int.from_bytes(pay[ft_off + 0x88 : ft_off + 0x8C], "little")
+        dsz = int.from_bytes(pay[ft_off + 0xA4 : ft_off + 0xA8], "little")
+        if dsz == w * h * 4:
+            arr = np.frombuffer(pay[ft_off - dsz : ft_off], dtype=np.uint8).reshape((h, w, 4))
+            save_webp(Image.fromarray(arr, "RGBA"), stamps_dir / f"{st_id}.webp")
+            cnt += 1
+
+    return {"stamps_webp": cnt}
+
+
 def main():
     parser = argparse.ArgumentParser(description="ExvsAssetPipeline: XB / OB / IB Native Asset Generator")
     parser.add_argument(
@@ -1179,7 +1231,11 @@ def main():
 
     s5 = generate_gauges(args.workspace, args.game_dir, out_images)
     total_stats.update(s5)
-    print("  [5/5] Customize Battle HUD Gauges (0x54440854.fhm2d):", s5)
+    print("  [5/6] Customize Battle HUD Gauges (0x54440854.fhm2d):", s5)
+
+    s6 = generate_stamps(args.game_dir, out_images)
+    total_stats.update(s6)
+    print("  [6/6] Communication Stamps (0xED5C1B36.fhm2d):", s6)
 
     print("\n[ExvsAssetPipeline] All categories generated successfully!")
     print(json.dumps(total_stats, indent=2, ensure_ascii=False))
