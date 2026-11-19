@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Reports & temp outputs
+update_diff_report.json
+*.tmp
+*.bak
+workspace/
+out/
+
+# C++ build artifacts
+*.obj
+*.pdb
+*.ilk
