@@ -1003,6 +1003,122 @@ def ensure_ui_workspace(ws_tex: Path, ib_dir: Path, core_dir: Path) -> None:
             writer.writerows(rows_out)
 
 
+def generate_gauges(workspace: Path, game_dir: Path, out_images: Path) -> Dict[str, int]:
+    """
+    Parses 0x54440854.fhm2d (Master Customize UI Gauge Table: 60 rows in IB)
+    and synthesizes 1920x1080 battle HUD gauge preview images (`images/gauges/{id}.webp`)
+    from the 15 native RGBA8 46XT textures inside each Gauge package:
+      - TeamBase.png   (600x200) -> (0, 0)
+      - EnemyBase.png  (600x200) -> (0, 0)
+      - TimerBase.png  (300x200) -> (468, 0)
+      - RadarBase.png  (400x400) -> (1520, 0)
+      - ArmorBase.png  (500x348) -> (0, 732)
+      - ExBurstBase.png(428x228) -> (373, 852)
+      - BoostBase.png  (600x228) -> (660, 852)
+      - WeaponBase.png (348x156) -> (1572, 702), (1572, 802), (1572, 902)
+      - ChargeBase.png (252x104) -> (1566, 770)
+    """
+    gauge_db = game_dir / "0x54440854.fhm2d"
+    if not gauge_db.exists():
+        return {"gauges_webp": 0}
+
+    gauges_dir = out_images / "gauges"
+    gauges_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse 0x54440854.fhm2d SDB1 table
+    blocks = list(iter_fhm2d_deflate_blocks(gauge_db.read_bytes()))
+    blob = blocks[1][3]
+    num_rows, num_cols, row_stride = struct.unpack_from("<III", blob, 0x10)
+    col_hashes = list(struct.unpack_from(f"<{num_cols}I", blob, 0x20))
+    desc_off = 0x20 + num_cols * 4
+    col_descs = [struct.unpack_from("<QI", blob, desc_off + c * 12) for c in range(num_cols)]
+    rows_data_off = (num_cols + 2) * 16 + 4 * num_rows
+
+    gauge_pkgs: Dict[int, int] = {}
+    for r in range(num_rows):
+        rbase = rows_data_off + r * row_stride
+        row_dict = {}
+        for (col_off, col_type), col_hash in zip(col_descs, col_hashes):
+            val = struct.unpack_from("<I", blob, rbase + col_off)[0]
+            row_dict[col_hash] = val
+        gid = row_dict.get(0x1111D441, 0)
+        ghash = row_dict.get(0x338558B9, 0)
+        if ghash != 0 and (game_dir / f"0x{ghash:08X}.fhm2d").exists():
+            gauge_pkgs[gid] = ghash
+
+    def extract_gauge_rgba_textures(fhm_path: Path) -> List[np.ndarray]:
+        blks = list(iter_fhm2d_deflate_blocks(fhm_path.read_bytes()))
+        pay = b"".join(b for _, _, _, b in blks[1:])
+        texs: List[np.ndarray] = []
+        for idx in range(15):
+            tag = f"46XTimg-{idx:05d}".encode("ascii")
+            pos = pay.find(tag)
+            if pos == -1:
+                break
+            ft_off = pos - 0x40
+            w = int.from_bytes(pay[ft_off + 0x84 : ft_off + 0x88], "little")
+            h = int.from_bytes(pay[ft_off + 0x88 : ft_off + 0x8C], "little")
+            dsz = int.from_bytes(pay[ft_off + 0xA4 : ft_off + 0xA8], "little")
+            arr = np.frombuffer(pay[ft_off - dsz : ft_off], dtype=np.uint8).reshape((h, w, 4))
+            texs.append(arr)
+        return texs
+
+    def build_gauge_canvas(fhm_path: Path) -> np.ndarray:
+        dds = extract_gauge_rgba_textures(fhm_path)
+        if len(dds) < 15:
+            return np.zeros((1080, 1920, 4), dtype=np.float32)
+        if dds[0].shape[1] == 428 and dds[1].shape[1] == 600:
+            dds[0], dds[1] = dds[1], dds[0]
+        canvas = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        placements = [
+            (12, 0, 0),      # EnemyBase
+            (11, 0, 0),      # TeamBase
+            (13, 468, 0),    # TimerBase
+            (14, 1520, 0),   # RadarBase
+            (10, 0, 732),    # ArmorBase
+            (1,  373, 852),  # ExBurstBase
+            (0,  660, 852),  # BoostBase
+            (2,  1572, 702), # WeaponBase 1
+            (2,  1572, 802), # WeaponBase 2
+            (2,  1572, 902), # WeaponBase 3
+            (3,  1566, 770), # ChargeBase Slot 1
+        ]
+        for idx, x, y in placements:
+            canvas.alpha_composite(Image.fromarray(dds[idx], "RGBA"), (x, y))
+        return np.array(canvas, dtype=np.float32)
+
+    template_dir = workspace.parent / "gauge_template"
+    bg_path = template_dir / "hud_bg.webp"
+    fg_path = template_dir / "hud_fg.webp"
+    has_template = bg_path.exists() and fg_path.exists()
+    if has_template:
+        B = np.array(Image.open(bg_path).convert("RGB"), dtype=np.float32)
+        fg = np.array(Image.open(fg_path).convert("RGBA"), dtype=np.float32)
+        alpha_f = fg[:, :, 3:4] / 255.0
+        T_F = 1.0 - alpha_f
+        F_pre = fg[:, :, :3] * alpha_f
+
+    cnt = 0
+    for gid, ghash in sorted(gauge_pkgs.items()):
+        out_p = gauges_dir / f"{gid}.webp"
+        if out_p.exists():
+            cnt += 1
+            continue
+        fhm_p = game_dir / f"0x{ghash:08X}.fhm2d"
+        g = build_gauge_canvas(fhm_p)
+        if has_template:
+            c = g[:, :, :3]
+            a = g[:, :, 3:4] / 255.0
+            m = a * c + (1.0 - a) * B
+            pred = np.clip(F_pre + T_F * m, 0.0, 255.0).astype(np.uint8)
+            Image.fromarray(pred, "RGB").save(out_p, "WEBP", quality=90)
+        else:
+            Image.fromarray(g.astype(np.uint8), "RGBA").save(out_p, "WEBP", quality=90)
+        cnt += 1
+
+    return {"gauges_webp": cnt}
+
+
 def main():
     parser = argparse.ArgumentParser(description="ExvsAssetPipeline: XB / OB / IB Native Asset Generator")
     parser.add_argument(
@@ -1059,7 +1175,11 @@ def main():
 
     s4 = generate_ms_pilots_stickers_team_stages(args.workspace, args.game_dir, webui_data, out_images)
     total_stats.update(s4)
-    print("  [4/4] Mobile Suits, Skins, History, Pilots, Stickers, Team & Title Plates:", s4)
+    print("  [4/5] Mobile Suits, Skins, History, Pilots, Stickers, Team & Title Plates:", s4)
+
+    s5 = generate_gauges(args.workspace, args.game_dir, out_images)
+    total_stats.update(s5)
+    print("  [5/5] Customize Battle HUD Gauges (0x54440854.fhm2d):", s5)
 
     print("\n[ExvsAssetPipeline] All categories generated successfully!")
     print(json.dumps(total_stats, indent=2, ensure_ascii=False))

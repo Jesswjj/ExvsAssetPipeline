@@ -384,6 +384,22 @@ def load_sdb1_stamps(ib_dir: Path) -> Dict[int, int]:
     return out
 
 
+def load_sdb1_gauges(ib_dir: Path) -> Dict[int, int]:
+    """Parses 0x54440854.fhm2d (Master Customize UI Gauge Table). Returns {gauge_id: pkg_hash}."""
+    gauge_db = ib_dir / "0x54440854.fhm2d"
+    if not gauge_db.exists():
+        return {}
+    blocks = list(iter_fhm2d_deflate_blocks(gauge_db.read_bytes()))
+    _, _, rows = parse_sdb1_blob(blocks[1][3])
+    out: Dict[int, int] = {}
+    for vals in rows:
+        gid = vals.get(0x1111D441, 0)
+        h = vals.get(0x338558B9, 0)
+        if is_valid_texture_pkg(ib_dir, h):
+            out[gid] = h
+    return dict(sorted(out.items()))
+
+
 # ============================================================================
 # Helper for Reading JSON Item Sub-Ids (supports `Id`, `ID`, and `CostumeId`/`SkinId`/`PoseId`)
 # ============================================================================
@@ -427,18 +443,22 @@ def scan_updates(
     sdb_ms = load_sdb1_mobile_suits(ib_dir, include_embedded_names=False)
     sdb_navis = load_sdb1_navigators(ib_dir, include_embedded_names=False)
     sdb_stamps = load_sdb1_stamps(ib_dir)
+    sdb_gauges = load_sdb1_gauges(ib_dir)
 
     ms_json_path = webui_data_dir / "MobileSuits.json"
     navi_json_path = webui_data_dir / "Navigators.json"
     stamps_json_path = webui_data_dir / "messages" / "Stamps.json"
+    gauges_json_path = webui_data_dir / "Gauges.json"
 
     ms_json = json.loads(ms_json_path.read_text(encoding="utf-8-sig"))
     navi_json = json.loads(navi_json_path.read_text(encoding="utf-8-sig"))
     stamps_json = json.loads(stamps_json_path.read_text(encoding="utf-8-sig")) if stamps_json_path.exists() else []
+    gauges_json = json.loads(gauges_json_path.read_text(encoding="utf-8-sig")) if gauges_json_path.exists() else []
 
     json_ms_map = {x["Id"]: x for x in ms_json if 0 < x["Id"] < 50000}
     json_navi_map = {x["Id"]: x for x in navi_json if x["Id"] > 0}
     json_stamp_ids = {_sub_id(x) for x in stamps_json if _is_existing_item(x)}
+    json_gauge_ids = {_sub_id(x) for x in gauges_json if x.get("Existence") not in (False, "Not Existed", "None", None)}
 
     diff_result: Dict[str, Any] = {
         "new_mobile_suits": [],
@@ -451,6 +471,7 @@ def scan_updates(
         "new_navigator_costumes": [],
         "removed_navigator_costumes": [],
         "new_stamps": [],
+        "new_gauges": [],
     }
 
     # 1. Compare Mobile Suits, Pilot Costumes, Skins, Poses
@@ -560,11 +581,16 @@ def scan_updates(
                 "CostumeId": cid,
             })
 
-    # 3. Compare Stamps
+    # 3. Compare Stamps & Gauges
     for st_id in sorted(set(sdb_stamps.keys()) - json_stamp_ids):
         diff_result["new_stamps"].append({
             "StampId": st_id,
             "Pkg": f"0x{sdb_stamps[st_id]:08X}",
+        })
+    for g_id in sorted(set(sdb_gauges.keys()) - json_gauge_ids):
+        diff_result["new_gauges"].append({
+            "GaugeId": g_id,
+            "Pkg": f"0x{sdb_gauges[g_id]:08X}",
         })
 
     # Print formatted summary
@@ -576,6 +602,7 @@ def scan_updates(
     print(f"  [统计] 客户端总表可玩机体数 : {len(sdb_ms)} 台 (JSON: {len(json_ms_map)} 台)")
     print(f"  [统计] 客户端总表领航员数   : {len(sdb_navis)} 名 (JSON: {len(json_navi_map)} 名)")
     print(f"  [统计] 客户端总表通信印章数 : {len(sdb_stamps)} 个 (JSON: {len(json_stamp_ids)} 个)")
+    print(f"  [统计] 客户端总表UI仪表盘数 : {len(sdb_gauges)} 个 (JSON: {len(json_gauge_ids)} 个)")
     print("-" * 76)
     print(f"  + 新增机体 (New Mobile Suits)         : {len(diff_result['new_mobile_suits'])}")
     for item in diff_result["new_mobile_suits"]:
@@ -615,6 +642,7 @@ def scan_updates(
         )
 
     print(f"  + 新增通信印章 (New Stamps)           : {len(diff_result['new_stamps'])}")
+    print(f"  + 新增UI仪表盘 (New Gauges)           : {len(diff_result['new_gauges'])}")
     print("=" * 76)
 
     if report_out:
@@ -837,6 +865,7 @@ def audit_data_and_images(webui_data_dir: Path, webui_images_dir: Path) -> bool:
     t_bg_json = json.loads((webui_data_dir / "team" / "Backgrounds.json").read_text(encoding="utf-8-sig"))
     t_em_json = json.loads((webui_data_dir / "team" / "Emblems.json").read_text(encoding="utf-8-sig"))
     titles_json = json.loads((webui_data_dir / "titles" / "Titles.json").read_text(encoding="utf-8-sig"))
+    gauges_json = json.loads((webui_data_dir / "Gauges.json").read_text(encoding="utf-8-sig"))
 
     def stems(rel: str, ext: str = "*.webp") -> Set[str]:
         d = webui_images_dir / rel
@@ -923,6 +952,11 @@ def audit_data_and_images(webui_data_dir: Path, webui_images_dir: Path) -> bool:
             "titles/Titles.json -> titles/",
             {str(_sub_id(x)) for x in titles_json if _is_existing_item(x)},
             stems("titles", "*.webp") | stems("titles", "*.gif"),
+        ),
+        (
+            "Gauges.json -> gauges/",
+            {str(_sub_id(x)) for x in gauges_json if x.get("Existence") not in (False, "Not Existed", "None", None)},
+            {p.stem for p in (webui_images_dir / "gauges").glob("*.webp")},
         ),
     ]
 
