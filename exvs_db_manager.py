@@ -762,12 +762,17 @@ def sync_sdb1_to_json(ib_dir: Path, webui_data_dir: Path) -> None:
             # Costumes
             cur_c_ids = _ms_costume_ids_from_json(entry)
             sdb_c_ids = {c.costume_id for c in sdb_u.costumes}
-            if cur_c_ids != sdb_c_ids:
+            if len(sdb_c_ids) <= 1:
+                entry.pop("Costumes", None)
+            elif cur_c_ids != sdb_c_ids or any(set(c.keys()) != {"Id", "Value"} for c in (entry.get("Costumes") or [])):
                 cur_costumes = {_sub_id(c, "CostumeId"): c for c in (entry.get("Costumes") or [])}
                 new_c_list = []
                 for c in sdb_u.costumes:
                     if c.costume_id in cur_costumes:
-                        new_c_list.append(cur_costumes[c.costume_id])
+                        new_c_list.append({
+                            "Id": c.costume_id,
+                            "Value": cur_costumes[c.costume_id].get("Value", "デフォルト" if c.costume_id == 0 else f"衣装{c.costume_id}"),
+                        })
                     else:
                         new_c_list.append({
                             "Id": c.costume_id,
@@ -1109,7 +1114,6 @@ def crud_ms_upsert(
             "SeriesTC": series_cn or "",
             "SeriesTCTW": series_cn or "",
             "Cost": cost or 2000,
-            "Costumes": [{"Id": 0, "Value": "デフォルト"}],
             "Poses": [{"Id": 0, "Value": "Default"}],
         }
         ms_list.append(entry)
