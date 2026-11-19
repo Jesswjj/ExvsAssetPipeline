@@ -129,6 +129,25 @@ def iter_fhm2d_deflate_blocks(blob: bytes, start_offset: int = 0x30, chunk_size:
         index += 1
 
 
+def decode_sdb1_str(raw: bytes) -> str:
+    """
+    Decodes an obfuscated UTF-8 string from an SDB1 string pool (`col_type == 7`):
+      1. Odd byte indices are bitwise inverted (`b ^= 0xFF`).
+      2. Adjacent bit pairs are swapped (`((b & 0xAA) >> 1) | ((b & 0x55) << 1)`).
+      3. Each byte at index `i` is rotated right by `i % 7` bits.
+    """
+    out = bytearray()
+    for i, b in enumerate(raw):
+        if i & 1:
+            b ^= 0xFF
+        b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1)
+        r = i % 7
+        if r:
+            b = ((b >> r) | (b << (8 - r))) & 0xFF
+        out.append(b)
+    return out.decode("utf-8", errors="replace")
+
+
 def parse_sdb1_blob(blob: bytes) -> Tuple[List[int], List[int], List[Dict[int, int]]]:
     """
     Parses a decompressed SDB1 / FHM binary table blob.
@@ -381,6 +400,29 @@ def load_sdb1_stamps(ib_dir: Path) -> Dict[int, int]:
         h = vals.get(0xC5A29798, 0)
         if st_id > 0 and is_valid_texture_pkg(ib_dir, h):
             out[st_id] = h
+    return out
+
+
+def load_sdb1_stamp_labels(ib_dir: Path) -> Dict[int, str]:
+    """Parses 0xED5C1B36.fhm2d string column 0xD139963F and returns {stamp_id: label_str}."""
+    stamp_db = ib_dir / "0xED5C1B36.fhm2d"
+    if not stamp_db.exists():
+        return {}
+    blocks = list(iter_fhm2d_deflate_blocks(stamp_db.read_bytes()))
+    blob = blocks[1][3]
+    num_rows, num_cols, row_stride = struct.unpack_from("<III", blob, 0x10)
+    rows_data_off = (num_cols + 2) * 16 + 4 * num_rows
+    out: Dict[int, str] = {}
+    for r in range(num_rows):
+        rbase = rows_data_off + r * row_stride
+        st_id = struct.unpack_from("<I", blob, rbase + 0)[0]
+        str_off = struct.unpack_from("<Q", blob, rbase + 12)[0]
+        if 0 < str_off < len(blob):
+            end = blob.find(b"\x00", str_off)
+            raw_lbl = decode_sdb1_str(blob[str_off:end]).strip()
+            # Strip leading numeric ID prefix like "440  "
+            parts = raw_lbl.split(None, 1)
+            out[st_id] = parts[1].strip() if len(parts) == 2 and parts[0].isdigit() else raw_lbl
     return out
 
 
@@ -827,18 +869,23 @@ def sync_sdb1_to_json(ib_dir: Path, webui_data_dir: Path) -> None:
     stamps_json_path = webui_data_dir / "messages" / "Stamps.json"
     added_stamps = 0
     if stamps_json_path.exists() and sdb_stamps:
+        stamp_labels = load_sdb1_stamp_labels(ib_dir)
         stamps_list = json.loads(stamps_json_path.read_text(encoding="utf-8-sig"))
         stamps_by_id = {_sub_id(x): x for x in stamps_list}
         for st_id in sorted(sdb_stamps.keys()):
+            lbl = stamp_labels.get(st_id, "")
             if st_id not in stamps_by_id:
                 stamps_list.append({
                     "ID": st_id,
-                    "Value": f"通信スタンプ {st_id}",
+                    "Value": lbl or f"通信スタンプ {st_id}",
                     "Existence": "IB",
+                    "Clues": lbl,
                 })
                 added_stamps += 1
             elif not _is_existing_item(stamps_by_id[st_id]):
                 stamps_by_id[st_id]["Existence"] = "IB"
+                if lbl and not stamps_by_id[st_id].get("Clues"):
+                    stamps_by_id[st_id]["Clues"] = lbl
                 added_stamps += 1
         stamps_list.sort(key=lambda x: _sub_id(x))
         stamps_json_path.write_text(json.dumps(stamps_list, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
